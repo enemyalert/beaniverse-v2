@@ -1,0 +1,7 @@
+discord.py>=2.3.0
+python-dotenv>=1.0.0
+pymongo>=4.6.0
+dnspython>=2.6.0
+python-json-logger>=2.0.7
+aiofiles>=23.2.1
+asyncio>=3.4.3
