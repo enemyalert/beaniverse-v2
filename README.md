@@ -2,7 +2,7 @@
 Beans s2s discord bot. [Add Beaniverse on your server!](https://discord.com/oauth2/authorize?client_id=992874324996399196&scope=bot&permissions=8)
 
 - install python 3.12.6
-- run virtual environment
+- install virtual environment
 - install `pip install requirements.txt` on your shell
 - add `.env` on your file
 ```
