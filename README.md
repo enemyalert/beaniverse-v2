@@ -13,3 +13,4 @@ AUTHORIZED_USERS=
 ```
 - tweak the channels in some files there
 - run `python main.py`
+- After running the bot, `blacklist.txt` will appear. You can optionally insert your desired blacklisted word/s. Then rerun the program.
