@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from pymongo import MongoClient
 import os
 from datetime import datetime
@@ -9,13 +9,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-AUTHORIZED_USER_ID = 624471886054686731
+AUTHORIZED_USERS = [int(id.strip()) for id in os.getenv('AUTHORIZED_USERS', '').split(',')]
 
-class GlobalBanSystem(commands.Cog):
+class BeaniverseBanSystem(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-        # MongoDB setup
         mongodb_uri = os.getenv('MONGODB_URI')
         if not mongodb_uri:
             raise ValueError("MONGODB_URI not found in environment variables")
@@ -24,11 +23,9 @@ class GlobalBanSystem(commands.Cog):
         self.db = self.client['global_chat']
         self.bans = self.db['bans']
 
-        # Set up indexes
         self.setup_indexes()
 
     def setup_indexes(self) -> None:
-        """Setup MongoDB indexes for the bans collection."""
         try:
             self.bans.create_index("user_id")
             self.bans.create_index("server_id")
@@ -37,7 +34,6 @@ class GlobalBanSystem(commands.Cog):
             print(f"Error creating ban system indexes: {e}")
 
     def is_banned(self, user_id: Optional[int] = None, server_id: Optional[int] = None) -> bool:
-        """Check if a user or server is banned."""
         if user_id:
             return bool(self.bans.find_one({"user_id": user_id, "active": True}))
         if server_id:
@@ -45,8 +41,7 @@ class GlobalBanSystem(commands.Cog):
         return False
 
     async def check_permissions(self, interaction: discord.Interaction) -> bool:
-        """Check if the user has permission to use ban commands."""
-        if interaction.user.id != AUTHORIZED_USER_ID:
+        if interaction.user.id not in AUTHORIZED_USERS:
             await interaction.response.send_message(
                 "You don't have permission to use this command.", 
                 ephemeral=True
@@ -54,181 +49,280 @@ class GlobalBanSystem(commands.Cog):
             return False
         return True
 
-    async def announce_to_registered_channels(self, message: str):
-        """Announce a message to all registered channels."""
-        registered_channels = self.db['registered_channels'].find()
+    async def announce_to_registered_channels(self, user: discord.User, reason: str, banned_by: discord.User, action: str = "banned"):
+        embed = discord.Embed(
+            title=f"🚫 Beaniverse {'Ban' if action == 'banned' else 'Unban'} Notification",
+            description=f"A user has been {action} from the Beaniverse network.",
+            color=discord.Color.red() if action == "banned" else discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(
+            name=f"{action.title()} User",
+            value=f"{user.mention} (`{user.name}`)",
+            inline=True
+        )
+        
+        if action == "banned":
+            embed.add_field(
+                name=f"{action.title()} By",
+                value=banned_by.mention,
+                inline=True
+            )
+            embed.add_field(
+                name="Reason",
+                value=reason,
+                inline=False
+            )
+        
+        registered_channels = self.db['servers'].find()
         for channel_data in registered_channels:
             channel_id = channel_data.get('channel_id')
             channel = self.bot.get_channel(channel_id)
             if channel:
-                await channel.send(message)
+                try:
+                    await channel.send(embed=embed)
+                except Exception as e:
+                    print(f"Failed to send {action} notification to channel {channel_id}: {e}")
 
-    async def send_dm(self, user: discord.User, embed: discord.Embed):
-        """Send a DM to a banned/unbanned user."""
+    async def send_dm(self, user: discord.User, embed: discord.Embed, view: Optional[discord.ui.View] = None):
         try:
-            await user.send(embed=embed)
+            if view:
+                await user.send(embed=embed, view=view)
+            else:
+                await user.send(embed=embed)
         except discord.Forbidden:
             print(f"Could not send DM to {user.name} ({user.id})")
 
-    @app_commands.command(name="banglobal", description="Ban a user or server from using global chat")
-    async def banglobal(
-        self,
-        interaction: discord.Interaction,
-        user: Optional[discord.User] = None,
-        server_id: Optional[str] = None,
-        reason: str = "No reason provided"
-    ):
+    @app_commands.command(name="ban", description="**Authorized user only.** Ban a user from using Beaniverse. ")
+    async def ban(self, interaction: discord.Interaction):
         if not await self.check_permissions(interaction):
             return
+        
+        await interaction.response.send_modal(BanModal())
 
-        if user and self.is_banned(user_id=user.id):
-            await interaction.response.send_message(f"{user.mention} is already banned.", ephemeral=True)
-            return
+    async def handle_ban_modal(self, interaction: discord.Interaction, user_id: int, reason: str):
+        try:
+            user = await self.bot.fetch_user(user_id)
+            
+            if not user:
+                await interaction.response.send_message("Could not find user with that ID.", ephemeral=True)
+                return
+                
+            if self.is_banned(user_id=user.id):
+                await interaction.response.send_message(f"{user.mention} is already banned.", ephemeral=True)
+                return
 
-        if server_id:
-            try:
-                server_id_int = int(server_id)
-                if self.is_banned(server_id=server_id_int):
-                    await interaction.response.send_message(f"Server {server_id} is already banned.", ephemeral=True)
+            confirm = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.danger)
+            cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+            view = discord.ui.View(timeout=60)
+            view.add_item(confirm)
+            view.add_item(cancel)
+
+            async def confirm_callback(button_interaction: discord.Interaction):
+                if button_interaction.user.id != interaction.user.id:
+                    await button_interaction.response.send_message("You cannot use these buttons.", ephemeral=True)
                     return
-            except ValueError:
-                await interaction.response.send_message("Invalid server ID format.", ephemeral=True)
-                return
 
-        confirm = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.danger)
-        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
-        view = discord.ui.View(timeout=60)
-        view.add_item(confirm)
-        view.add_item(cancel)
+                db_ban_data = {
+                    "user_id": user.id,
+                    "user_name": str(user),
+                    "banned_by": interaction.user.id,
+                    "reason": reason,
+                    "timestamp": datetime.utcnow(),
+                    "active": True
+                }
 
-        ban_data = {"user": user, "server_id": server_id, "reason": reason, "interaction": interaction}
-
-        async def confirm_callback(button_interaction: discord.Interaction):
-            if button_interaction.user.id != interaction.user.id:
-                await button_interaction.response.send_message("You cannot use these buttons.", ephemeral=True)
-                return
-
-            db_ban_data = {
-                "banned_by": interaction.user.id,
-                "reason": reason,
-                "timestamp": datetime.utcnow(),
-                "active": True
-            }
-
-            if user:
-                db_ban_data["user_id"] = user.id
-                db_ban_data["user_name"] = str(user)
                 self.bans.insert_one(db_ban_data)
+                
                 embed = discord.Embed(
-                    title="You have been banned from Global Chat",
-                    description=f"You were banned for the following reason: {reason}",
+                    title="Message Not Sent",
+                    description="You are permanently banned from the Beaniverse network.",
                     color=discord.Color.red(),
                     timestamp=datetime.utcnow()
                 )
-                embed.add_field(name="Banned By", value=interaction.user.mention)
-                await self.send_dm(user, embed)
-                await self.announce_to_registered_channels(f"User {user.mention} has been banned from global chat.")
+                embed.add_field(name="Reason", value=reason, inline=False)
+                embed.add_field(name="Banned By", value=interaction.user.mention, inline=False)
+                embed.add_field(
+                    name="Appeal",
+                    value="If you believe this ban was issued in error, you can appeal in our support server.",
+                    inline=False
+                )
 
-            elif server_id:
-                db_ban_data["server_id"] = int(server_id)
-                self.bans.insert_one(db_ban_data)
-                await self.announce_to_registered_channels(f"Server {server_id} has been banned from global chat.")
+                view = discord.ui.View()
+                view.add_item(discord.ui.Button(
+                    label="Support Server",
+                    style=discord.ButtonStyle.link,
+                    url="https://discord.gg/HngQ9JDdmJ"
+                ))
 
-            await button_interaction.response.edit_message(content="Ban confirmed.", view=None)
+                await self.send_dm(user, embed, view)
+                
+                await self.announce_to_registered_channels(user, reason, interaction.user, "banned")
+                
+                await button_interaction.response.edit_message(content="Ban confirmed.", view=None)
 
-        async def cancel_callback(button_interaction: discord.Interaction):
-            await button_interaction.response.edit_message(content="Ban action cancelled.", view=None)
+            async def cancel_callback(button_interaction: discord.Interaction):
+                await button_interaction.response.edit_message(content="Ban action cancelled.", view=None)
 
-        confirm.callback = confirm_callback
-        cancel.callback = cancel_callback
+            confirm.callback = confirm_callback
+            cancel.callback = cancel_callback
 
-        embed = discord.Embed(
-            title="Confirm Global Chat Ban",
-            color=discord.Color.yellow(),
-            description="Are you sure you want to proceed with this ban?"
-        )
-        if user:
+            embed = discord.Embed(
+                title="Confirm Beaniverse Ban",
+                color=discord.Color.yellow(),
+                description="Are you sure you want to proceed with this ban?"
+            )
             embed.add_field(name="Target User", value=f"{user.mention} ({user.id})")
-        else:
-            embed.add_field(name="Target Server", value=server_id)
-        embed.add_field(name="Reason", value=reason)
+            embed.add_field(name="Reason", value=reason)
 
-        await interaction.response.send_message(embed=embed, view=view)
+            await interaction.response.send_message(embed=embed, view=view)
+            
+        except Exception as e:
+            await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
 
-    @app_commands.command(name="unbanglobal", description="Unban a user or server from global chat")
-    async def unbanglobal(
-        self,
-        interaction: discord.Interaction,
-        user: Optional[discord.User] = None,
-        server_id: Optional[str] = None,
-        reason: str = "No reason provided"
-    ):
+    @app_commands.command(name="unban", description="**Authorized user only**. Unban a user from Beaniverse.")    
+    async def unban(self, interaction: discord.Interaction):
         if not await self.check_permissions(interaction):
             return
 
-        confirm = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.success)
-        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        banned_users = list(self.bans.find({"active": True}))
+        if not banned_users:
+            await interaction.response.send_message("There are no banned users.", ephemeral=True)
+            return
+
+        select_menu = BannedUserSelect(banned_users)
+        
         view = discord.ui.View(timeout=60)
-        view.add_item(confirm)
-        view.add_item(cancel)
+        view.add_item(select_menu)
 
-        unban_data = {"user": user, "server_id": server_id, "reason": reason}
-
-        async def confirm_callback(button_interaction: discord.Interaction):
-            if user:
-                query = {"user_id": user.id, "active": True}
-            else:
-                try:
-                    query = {"server_id": int(server_id), "active": True}
-                except ValueError:
-                    await button_interaction.response.send_message("Invalid server ID format.", ephemeral=True)
-                    return
-
-            ban_doc = self.bans.find_one(query)
-            if not ban_doc:
-                await button_interaction.response.send_message("No active ban found.", ephemeral=True)
+        async def select_callback(select_interaction: discord.Interaction):
+            user_id = int(select_interaction.data["values"][0])
+            user = await self.bot.fetch_user(user_id)
+            
+            if not user:
+                await select_interaction.response.send_message("Could not find user.", ephemeral=True)
                 return
 
-            self.bans.delete_one({"_id": ban_doc["_id"]})
+            confirm = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.success)
+            cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+            unban_view = discord.ui.View(timeout=60)
+            unban_view.add_item(confirm)
+            unban_view.add_item(cancel)
 
-            if user:
+            async def confirm_callback(button_interaction: discord.Interaction):
+                if button_interaction.user.id != select_interaction.user.id:
+                    await button_interaction.response.send_message("You cannot use these buttons.", ephemeral=True)
+                    return
+
+                self.bans.update_one(
+                    {"user_id": user.id, "active": True},
+                    {"$set": {"active": False, "unbanned_by": select_interaction.user.id, "unban_time": datetime.utcnow()}}
+                )
+
                 embed = discord.Embed(
-                    title="You have been unbanned from Global Chat",
-                    description=f"You were unbanned for the following reason: {reason}",
+                    title="Beaniverse Unban",
+                    description="You have been unbanned from the Beaniverse network.",
                     color=discord.Color.green(),
                     timestamp=datetime.utcnow()
                 )
-                embed.add_field(name="Unbanned By", value=interaction.user.mention)
-                await self.send_dm(user, embed)
-                await self.announce_to_registered_channels(f"User {user.mention} has been unbanned from global chat.")
+                embed.add_field(
+                    name="Unbanned By",
+                    value=select_interaction.user.mention,
+                    inline=False
+                )
 
-            else:
-                await self.announce_to_registered_channels(f"Server {server_id} has been unbanned from global chat.")
+                view = discord.ui.View()
+                view.add_item(discord.ui.Button(
+                    label="Support Server",
+                    style=discord.ButtonStyle.link,
+                    url="https://discord.gg/HngQ9JDdmJ"
+                ))
 
-            await button_interaction.response.edit_message(content="Unban confirmed.", view=None)
+                await self.send_dm(user, embed, view)
+                
+                await self.announce_to_registered_channels(user, "", interaction.user, "unbanned")
+                
+                await button_interaction.response.edit_message(content=f"Successfully unbanned {user.mention}", view=None)
 
-        async def cancel_callback(button_interaction: discord.Interaction):
-            await button_interaction.response.edit_message(content="Unban action cancelled.", view=None)
+            async def cancel_callback(button_interaction: discord.Interaction):
+                await button_interaction.response.edit_message(content="Unban action cancelled.", view=None)
 
-        confirm.callback = confirm_callback
-        cancel.callback = cancel_callback
+            confirm.callback = confirm_callback
+            cancel.callback = cancel_callback
 
-        embed = discord.Embed(
-            title="Confirm Global Chat Unban",
-            color=discord.Color.yellow(),
-            description="Are you sure you want to proceed with this unban?"
-        )
-        if user:
+            embed = discord.Embed(
+                title="Confirm Beaniverse Unban",
+                color=discord.Color.yellow(),
+                description="Are you sure you want to unban this user?"
+            )
             embed.add_field(name="Target User", value=f"{user.mention} ({user.id})")
-        else:
-            embed.add_field(name="Target Server", value=server_id)
-        embed.add_field(name="Reason", value=reason)
 
-        await interaction.response.send_message(embed=embed, view=view)
+            await select_interaction.response.edit_message(embed=embed, view=unban_view)
+
+        select_menu.callback = select_callback
+        await interaction.response.send_message("Select a user to unban:", view=view, ephemeral=True)
 
     async def cog_unload(self) -> None:
-        """Cleanup when cog is unloaded."""
         self.client.close()
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(GlobalBanSystem(bot))
+    await bot.add_cog(BeaniverseBanSystem(bot))
+
+class BannedUserSelect(discord.ui.Select):
+    def __init__(self, banned_users: List[Dict[str, Any]]):
+        options = []
+        for user_data in banned_users[:25]:
+            user_id = user_data["user_id"]
+            user_name = user_data.get("user_name", f"Unknown User ({user_id})")
+            options.append(
+                discord.SelectOption(
+                    label=user_name,
+                    value=str(user_id),
+                    description=f"ID: {user_id}"
+                )
+            )
+            
+        super().__init__(
+            placeholder="Select a user to unban...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+
+class BanModal(discord.ui.Modal, title="Beaniverse Ban Form"):
+    def __init__(self):
+        super().__init__()
+        
+        self.add_item(discord.ui.TextInput(
+            label="User ID",
+            placeholder="Enter the user ID to ban",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=20
+        ))
+        
+        self.add_item(discord.ui.TextInput(
+            label="Reason",
+            placeholder="Enter the reason for the ban",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1000
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.children[0].value)
+            reason = self.children[1].value
+            
+            ban_system = interaction.client.get_cog('BeaniverseBanSystem')
+            if not ban_system:
+                await interaction.response.send_message("Ban system is currently unavailable.", ephemeral=True)
+                return
+                
+            await ban_system.handle_ban_modal(interaction, user_id, reason)
+            
+        except ValueError:
+            await interaction.response.send_message("Invalid user ID format.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)

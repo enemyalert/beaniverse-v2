@@ -1,3 +1,7 @@
+# ignore for obvious reasons ;)
+blacklist.txt
+1a1a1a1a.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

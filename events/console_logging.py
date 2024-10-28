@@ -18,6 +18,14 @@ class DiscordHandler(logging.Handler):
         self.queue: asyncio.Queue = asyncio.Queue()
         self.task: Optional[asyncio.Task] = None
         self.stopped = False
+        
+        self.level_colors = {
+            logging.DEBUG: 0x808080,    # Gray
+            logging.INFO: 0x00FF00,     # Green
+            logging.WARNING: 0xFFA500,  # Orange
+            logging.ERROR: 0xFF0000,    # Red
+            logging.CRITICAL: 0x8B0000  # Dark Red
+        }
 
     def emit(self, record: logging.LogRecord):
         if self.stopped:
@@ -25,30 +33,35 @@ class DiscordHandler(logging.Handler):
             
         try:
             msg = self.format(record)
-            # Split messages that are too long
-            while len(msg) > 1990:  # Discord has a 2000 char limit
+            color = self.level_colors.get(record.levelno, 0xFFFFFF)  # Default to white
+            
+            while len(msg) > 1990:  
                 split_msg = msg[:1990]
                 msg = msg[1990:]
-                asyncio.create_task(self._queue_message(f"```\n{split_msg}```"))
+                asyncio.create_task(self._queue_message(split_msg, color))
             
             if msg:
-                asyncio.create_task(self._queue_message(f"```\n{msg}```"))
+                asyncio.create_task(self._queue_message(msg, color))
         except Exception:
             self.handleError(record)
 
-    async def _queue_message(self, message: str):
-        await self.queue.put(message)
+    async def _queue_message(self, message: str, color: int):
+        await self.queue.put((message, color))
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._process_queue())
 
     async def _process_queue(self):
         while not self.queue.empty():
-            message = await self.queue.get()
+            message, color = await self.queue.get()
             try:
                 channel = self.bot.get_channel(self.channel_id)
                 if channel and isinstance(channel, discord.TextChannel):
-                    await channel.send(message)
-                await asyncio.sleep(0.5)  # Rate limiting protection
+                    embed = discord.Embed(
+                        description=f"```\n{message}```",
+                        color=color
+                    )
+                    await channel.send(embed=embed)
+                await asyncio.sleep(0.5) 
             except Exception as e:
                 print(f"Failed to send message to Discord: {e}", file=sys.stderr)
             finally:
@@ -70,7 +83,7 @@ class StderrCatcher:
         self.logger.setLevel(logging.INFO)
 
     def write(self, message: str):
-        if message.strip():  # Only log non-empty messages
+        if message.strip():  
             self.logger.info(message.strip())
         self.original_stderr.write(message)
 
@@ -85,20 +98,17 @@ def setup_console_logging(bot: commands.Bot, channel_id: int):
         bot: The Discord bot instance
         channel_id: The ID of the channel to log to
     """
-    # Create and set up the Discord handler
+
     discord_handler = DiscordHandler(bot, channel_id)
     discord_handler.setFormatter(
         logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     )
     
-    # Add handler to the root logger
     root_logger = logging.getLogger()
     root_logger.addHandler(discord_handler)
     
-    # Redirect stderr
     stderr_catcher = StderrCatcher(discord_handler)
     sys.stderr = stderr_catcher
 
-    # Store references to prevent garbage collection using setattr
     setattr(bot, '_discord_handler', discord_handler)
     setattr(bot, '_stderr_catcher', stderr_catcher)

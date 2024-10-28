@@ -1,5 +1,3 @@
-# handler.py
-
 import discord
 from discord.ext import commands
 from pymongo import MongoClient
@@ -8,52 +6,45 @@ from typing import Optional, Dict, Set, Tuple, List, Union
 import aiofiles
 import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import logging
 from logging.handlers import RotatingFileHandler
 from discord import TextChannel
+import re
+from events.nsfw import NSFWDetector
 
-# Load environment variables
 load_dotenv()
 
-# Get the directory where the current script is located
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Define the log directory and ensure it exists
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
-os.makedirs(LOG_DIR, exist_ok=True)  # Creates the directory if it doesn't exist
+os.makedirs(LOG_DIR, exist_ok=True)
 
-# Define the absolute path to the log file
-# Optionally, you can set LOG_PATH via an environment variable
 LOG_PATH = os.getenv('LOG_PATH', os.path.join(LOG_DIR, 'bot.log'))
 
-# Configure rotating logging
 try:
     rotating_handler = RotatingFileHandler(
         LOG_PATH,
-        maxBytes=5*1024*1024,  # 5 MB
-        backupCount=5,         # Keep up to 5 backup files
+        maxBytes=5*1024*1024,
+        backupCount=5,
         encoding='utf-8'
     )
 except Exception as e:
-    # Fallback to a basic file handler if RotatingFileHandler fails
     print(f"Failed to initialize RotatingFileHandler: {e}")
     rotating_handler = logging.FileHandler(LOG_PATH, encoding='utf-8')
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        rotating_handler,                # Rotating log file handler
-        logging.StreamHandler()          # Also log to console
+        rotating_handler,
+        logging.StreamHandler()
     ]
 )
 
 logger = logging.getLogger(__name__)
 
-# Define the absolute path to blacklist.txt
 BLACKLIST_PATH = os.path.join(BASE_DIR, 'blacklist.txt')
 
 
@@ -62,7 +53,6 @@ class MuteExpiredView(discord.ui.View):
         super().__init__()
         self.channel_id = channel_id
 
-        # Add the URL button directly in the constructor
         self.add_item(discord.ui.Button(
             label="Support Server",
             style=discord.ButtonStyle.secondary,
@@ -78,25 +68,38 @@ class GlobalChatHandler(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-        # MongoDB setup
         mongodb_uri = os.getenv('MONGODB_URI')
         if not mongodb_uri:
             logger.error("MONGODB_URI not found in environment variables.")
             raise ValueError("MONGODB_URI not found in environment variables")
 
-        # Configuration
-        self.SPAM_COOLDOWN = 2  # seconds (more lenient)
-        self.SPAM_THRESHOLD = 8  # messages
-        self.SPAM_TIME_WINDOW = 1  # second
-        self.BLACKLIST_COOLDOWN = 60  # seconds
-        self.MAX_MESSAGE_LENGTH = 2000  # Discord's limit
+        self.SPAM_COOLDOWN = 2
+        self.SPAM_THRESHOLD = 8
+        self.SPAM_TIME_WINDOW = 1
+        self.BLACKLIST_COOLDOWN = 60
+        self.MAX_MESSAGE_LENGTH = 2000
         self.MAX_ATTACHMENTS = 10
-        self.MUTE_CHECK_INTERVAL = 5  # seconds
+        self.MUTE_CHECK_INTERVAL = 5
         self.WEBHOOK_NAME = 'beaniverse'
 
+        self.DISCORD_INVITE_PATTERN = re.compile(
+            r'(?:https?://)?(?:www\.)?((?:discord\.(?:gg|io|me|li|com)|discordapp\.com)/(?:invite/)?[a-zA-Z0-9-]+)',
+            re.IGNORECASE
+        )
+        
+        self.ADULT_CONTENT_PATTERN = re.compile(
+            r'(?:https?://)?(?:www\.)?'
+            r'(?:'
+            r'(?:[a-zA-Z0-9\-]+\.)*(?:porn|pinayflix|jakol|hubad|iyot|kayat|kantot|xxx|sex|adult|nsfw|hentai|xvideos|pornhub|xnxx|xhamster|redtube|youporn)'
+            r'(?:\.[a-zA-Z]{2,})\b'
+            r'|'
+            r'(?:only\.)?fans/|onlyfans\.com'
+            r')',
+            re.IGNORECASE
+        )
+        
         try:
             self.client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=5000)
-            # The following line attempts to fetch server info to validate the connection
             self.client.server_info()
             self.db = self.client['global_chat']
             self.servers = self.db['servers']
@@ -107,23 +110,25 @@ class GlobalChatHandler(commands.Cog):
             logger.error(f"Failed to connect to MongoDB: {e}")
             raise
 
-        # Cache structures
         self.webhooks: Dict[int, discord.Webhook] = {}
         self.user_message_count: Dict[int, List[float]] = {}
         self.muted_users: Dict[int, Tuple[datetime, str, Optional[discord.Message], int]] = {}
         self.blacklisted_words: Set[str] = set()
         self.registered_channels: Set[int] = set()
+        self.nsfw_detector = NSFWDetector()
 
-        # Set up MongoDB indexes
         self.setup_indexes()
 
-        # Start background tasks
         self.bot.loop.create_task(self._load_blacklist())
         self.bot.loop.create_task(self.load_registered_channels())
         self.monitor_task = self.bot.loop.create_task(self.monitor_mutes())
 
+        self.reports = self.db['reports']
+        self.reports_counter = self.db['reports_counter']
+        
+        self.setup_report_indexes()
+
     def setup_indexes(self) -> None:
-        """Set up MongoDB indexes for better query performance."""
         try:
             self.users.create_index([("user_id", 1)], unique=True)
             self.servers.create_index([("channel_id", 1)], unique=True)
@@ -133,8 +138,17 @@ class GlobalChatHandler(commands.Cog):
         except Exception as e:
             logger.error(f"Error creating MongoDB indexes: {e}")
 
+    def setup_report_indexes(self) -> None:
+        try:
+            self.reports.create_index("report_number")
+            self.reports.create_index("reported_user_id")
+            self.reports.create_index("reporter_id")
+            self.reports.create_index("timestamp")
+            logger.info("Report system indexes created successfully!")
+        except Exception as e:
+            logger.error(f"Error creating report system indexes: {e}")
+
     async def _load_blacklist(self) -> None:
-        """Load blacklisted words from a file."""
         try:
             async with aiofiles.open(BLACKLIST_PATH, mode='r', encoding='utf-8') as f:
                 content = await f.read()
@@ -165,7 +179,6 @@ class GlobalChatHandler(commands.Cog):
             self.blacklisted_words = set()
 
     async def load_registered_channels(self) -> None:
-        """Load registered channels into cache."""
         try:
             servers = self.servers.find({}, {'channel_id': 1})
             self.registered_channels = {int(server['channel_id']) for server in servers if 'channel_id' in server}
@@ -175,25 +188,21 @@ class GlobalChatHandler(commands.Cog):
             self.registered_channels = set()
 
     def is_channel_registered(self, channel_id: int) -> bool:
-        """Check if a channel is registered for global chat."""
         return channel_id in self.registered_channels
 
     def contains_blacklisted_words(self, content: str) -> bool:
-        """Check if message contains blacklisted words."""
         return any(word in content.lower() for word in self.blacklisted_words)
 
     def is_user_muted(self, user_id: int) -> Tuple[bool, Optional[str], Optional[discord.Message], Optional[int]]:
-        """Check if a user is muted and return status, reason, mute message, and channel_id."""
         if user_id in self.muted_users:
             mute_end_time, reason, mute_message, channel_id = self.muted_users[user_id]
-            if datetime.utcnow() < mute_end_time:
+            if datetime.now(timezone.utc) < mute_end_time:
                 return True, reason, mute_message, channel_id
             else:
                 del self.muted_users[user_id]
         return False, None, None, None
 
     async def get_or_create_webhook(self, channel: TextChannel) -> Optional[discord.Webhook]:
-        """Get or create a webhook for the channel."""
         try:
             if channel.id in self.webhooks:
                 return self.webhooks[channel.id]
@@ -215,8 +224,24 @@ class GlobalChatHandler(commands.Cog):
             return None
 
     async def mute_user(self, user: Union[discord.User, discord.Member], duration: int, reason: str, channel: TextChannel) -> None:
-        """Mute a user and log the action."""
-        end_time = datetime.utcnow() + timedelta(seconds=duration)
+        current_time = datetime.now(timezone.utc)
+        end_time = current_time + timedelta(seconds=duration)
+        formatted_time = discord.utils.format_dt(end_time, style='R')
+
+        embed = discord.Embed(
+            title="You have been muted",
+            description=f"Reason: {reason}",
+            color=discord.Color.red()
+        )
+        embed.add_field(
+            name="Duration",
+            value=f"until in {duration} seconds"
+        )
+
+        logger.info(
+            f"Muted user {user.id} until {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"for reason: {reason}"
+        )
 
         try:
             self.users.update_one(
@@ -224,7 +249,7 @@ class GlobalChatHandler(commands.Cog):
                 {
                     '$push': {
                         'mute_history': {
-                            'timestamp': datetime.utcnow(),
+                            'timestamp': current_time,
                             'duration': duration,
                             'reason': reason
                         }
@@ -235,17 +260,6 @@ class GlobalChatHandler(commands.Cog):
             logger.info(f"Logged mute action for user {user.id}.")
         except Exception as e:
             logger.error(f"Failed to log mute action for user {user.id}: {e}")
-
-        embed = discord.Embed(
-            title="You have been muted",
-            description=f"Reason: {reason}",
-            color=discord.Color.red(),
-            timestamp=datetime.utcnow()
-        )
-        embed.add_field(
-            name="Duration",
-            value=f"Until {discord.utils.format_dt(end_time, style='R')}"
-        )
 
         is_muted, _, existing_mute_message, _ = self.is_user_muted(user.id)
         if is_muted and existing_mute_message:
@@ -282,17 +296,28 @@ class GlobalChatHandler(commands.Cog):
 
         self.muted_users[user.id] = (end_time, reason, mute_message, channel.id)
 
-        # Send a message in the channel
         try:
             await channel.send(f"{user.mention}, you are currently muted. Wait for the cooldown.", delete_after=5)
             logger.info(f"Sent mute notification in channel {channel.id} for user {user.id}.")
         except Exception as e:
             logger.error(f"Failed to send mute notification in channel {channel.id}: {e}")
 
+        async def unmute_task():
+            await asyncio.sleep(duration)
+            unmute_embed = discord.Embed(
+                title="Mute Expired",
+                description="You can now send messages again.",
+                color=discord.Color.green(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            view = MuteExpiredView(channel.id)
+            await user.send(embed=unmute_embed, view=view)
+        
+        self.bot.loop.create_task(unmute_task())
+
     async def monitor_mutes(self) -> None:
-        """Monitor and handle expired mutes."""
         while not self.bot.is_closed():
-            current_time = datetime.utcnow()
+            current_time = datetime.now(timezone.utc)
             expired_mutes = [
                 user_id
                 for user_id, (end_time, _, _, _) in self.muted_users.items()
@@ -328,15 +353,18 @@ class GlobalChatHandler(commands.Cog):
             await asyncio.sleep(self.MUTE_CHECK_INTERVAL)
 
     async def validate_message(self, message: discord.Message) -> Tuple[bool, Optional[str]]:
-        """Validate message content and return (is_valid, error_reason)."""
-        # First check if the channel is registered
         if not self.is_channel_registered(message.channel.id):
-            return False, None  # Silent fail for unregistered channels
+            return False, None
 
-        # Check if the user is muted
         is_muted, reason, _, _ = self.is_user_muted(message.author.id)
         if is_muted:
             return False, reason
+
+        if self.DISCORD_INVITE_PATTERN.search(message.content):
+            return False, "Discord invites are not allowed"
+
+        if self.ADULT_CONTENT_PATTERN.search(message.content):
+            return False, "Adult content links are not allowed"
 
         if len(message.content) > self.MAX_MESSAGE_LENGTH:
             return False, "Message exceeds maximum length"
@@ -347,7 +375,6 @@ class GlobalChatHandler(commands.Cog):
         if self.contains_blacklisted_words(message.content):
             return False, "Message contains prohibited words"
 
-        # Spam check
         user_id = message.author.id
         current_time = time.time()
 
@@ -368,21 +395,66 @@ class GlobalChatHandler(commands.Cog):
             if time_diff < self.SPAM_COOLDOWN:
                 return False, "Message sent too quickly"
 
+        if message.attachments:
+            is_nsfw, score, content_type = await self.nsfw_detector.check_message(message)
+            if is_nsfw:
+                if isinstance(message.channel, TextChannel):
+                    await self.mute_user(
+                        message.author,
+                        float('inf'),
+                        f"NSFW {content_type} detected (Score: {score:.2f})",
+                        message.channel
+                    )
+                return False, f"NSFW content detected"
+
         return True, None
 
     async def forward_message(self, message: discord.Message) -> None:
-        """Forward message to all registered channels with enhanced error handling."""
         if message.author.bot:
             return
 
-        # Check if source channel is registered
         if not self.is_channel_registered(message.channel.id):
             return
 
-        # Validate message
+        ban_system = self.bot.get_cog('GlobalBanSystem')
+        if ban_system and ban_system.is_banned(user_id=message.author.id):
+            try:
+                await message.delete()
+                
+                embed = discord.Embed(
+                    title="Message Not Sent",
+                    description="You are permanently banned from the global chat network.",
+                    color=discord.Color.red(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                embed.add_field(
+                    name="Appeal",
+                    value="If you believe this ban was issued in error, you can appeal in our support server.",
+                    inline=False
+                )
+                
+                view = discord.ui.View()
+                view.add_item(discord.ui.Button(
+                    label="Support Server",
+                    style=discord.ButtonStyle.link,
+                    url="https://discord.gg/HngQ9JDdmJ"
+                ))
+                
+                try:
+                    await message.author.send(embed=embed, view=view)
+                except discord.Forbidden:
+                    await message.channel.send(
+                        embed=embed,
+                        view=view,
+                        delete_after=15
+                    )
+            except Exception as e:
+                logger.error(f"Error handling banned user message: {e}")
+            return
+
         is_valid, error_reason = await self.validate_message(message)
         if not is_valid:
-            if error_reason:  # Only act if there's an error reason (not for unregistered channels)
+            if error_reason:
                 cooldown_duration = self.SPAM_COOLDOWN if "quickly" in error_reason else self.BLACKLIST_COOLDOWN
 
                 if isinstance(message.channel, TextChannel):
@@ -402,20 +474,18 @@ class GlobalChatHandler(commands.Cog):
                     logger.error(f"Failed to delete message from user {message.author.id}: {e}")
             return
 
-        # Log message
         try:
             self.message_logs.insert_one({
                 'user_id': message.author.id,
                 'channel_id': message.channel.id,
                 'content': message.content,
-                'timestamp': datetime.utcnow(),
+                'timestamp': datetime.now(timezone.utc),
                 'attachment_count': len(message.attachments)
             })
             logger.info(f"Logged message from user {message.author.id} in channel {message.channel.id}.")
         except Exception as e:
             logger.error(f"Failed to log message from user {message.author.id}: {e}")
 
-        # Forward to other registered channels
         for target_channel_id in self.registered_channels:
             if target_channel_id == message.channel.id:
                 continue
@@ -432,7 +502,6 @@ class GlobalChatHandler(commands.Cog):
             try:
                 webhook = await self.get_or_create_webhook(channel)
                 if webhook:
-                    # Update the username to include the server name
                     server_name = message.guild.name if message.guild else "Direct Message"
                     username = f"{message.author.display_name} | {server_name}"
 
@@ -445,18 +514,16 @@ class GlobalChatHandler(commands.Cog):
                         except Exception as e:
                             logger.error(f"Failed to process attachment from user {message.author.id}: {e}")
 
-                    # Ensure files is always a list
                     if not files:
                         files = []
 
-                    # Additional logging before sending
                     logger.debug(f"Preparing to send message to webhook in channel {target_channel_id} with {len(files)} files.")
 
                     await webhook.send(
                         username=username,
                         avatar_url=message.author.display_avatar.url,
                         content=message.content or "",
-                        files=files,  # Pass empty list if no files
+                        files=files,
                         allowed_mentions=discord.AllowedMentions(
                             everyone=False,
                             roles=False,
@@ -469,11 +536,9 @@ class GlobalChatHandler(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        """Listen for new messages and process them."""
         await self.forward_message(message)
 
     async def cleanup(self) -> None:
-        """Cleanup resources and connections."""
         self.monitor_task.cancel()
         try:
             await self.monitor_task
@@ -484,14 +549,34 @@ class GlobalChatHandler(commands.Cog):
             logger.info("MongoDB connection closed.")
         except Exception as e:
             logger.error(f"Error closing MongoDB connection: {e}")
+        self.nsfw_detector.cleanup()
 
     async def cog_unload(self) -> None:
-        """Proper cleanup on cog unload."""
         await self.cleanup()
         logger.info("GlobalChatHandler cog unloaded.")
 
+    async def store_report(self, report_data: dict) -> bool:
+        try:
+            self.reports.insert_one(report_data)
+            return True
+        except Exception as e:
+            logger.error(f"Error storing report: {e}")
+            return False
+
+    async def get_next_report_number(self) -> int:
+        try:
+            result = self.reports_counter.find_one_and_update(
+                {'_id': 'report_count'},
+                {'$inc': {'count': 1}},
+                upsert=True,
+                return_document=True
+            )
+            return result.get('count', 1)
+        except Exception as e:
+            logger.error(f"Error getting next report number: {e}")
+            return int(time.time())
+
 
 async def setup(bot: commands.Bot) -> None:
-    """Add the cog to the bot."""
     await bot.add_cog(GlobalChatHandler(bot))
     logger.info("GlobalChatHandler cog added to the bot.")

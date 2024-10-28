@@ -4,4 +4,9 @@ pymongo>=4.6.0
 dnspython>=2.6.0
 python-json-logger>=2.0.7
 aiofiles>=23.2.1
-asyncio>=3.4.3
+aiohttp>=3.9.1
+nudenet>=2.0.9
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.2.0
+

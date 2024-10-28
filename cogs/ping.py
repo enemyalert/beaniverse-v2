@@ -6,13 +6,13 @@ class Ping(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="ping", description="Check the bot's latency")
+    @app_commands.command(name="ping", description="Check Beaniverse's latency")
     async def ping(self, interaction: discord.Interaction):
         embed = discord.Embed(
-            title="🏓 Pong!",
-            color=discord.Color.green() 
+            title="🌐 Beaniverse Latency",
+            color=discord.Color.blue()
         )
-        embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)}ms", inline=False)
+        embed.add_field(name="Response Time", value=f"{round(self.bot.latency * 1000)}ms", inline=False)
 
         await interaction.response.send_message(embed=embed)
 
