@@ -5,7 +5,7 @@ To locally run this bot:
 - install python 3.12.6
 - install virtual environment
 - install `pip install requirements.txt` on your shell
-- add `.env` on your local directory
+- add `.env` file
 ```
 TOKEN=
 MONGODB_URI=
