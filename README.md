@@ -7,10 +7,10 @@ To locally run this bot:
 - install `pip install requirements.txt` on your shell
 - add `.env` file
 ```
-TOKEN= // Your discord token
-MONGODB_URI= // create a mongo database. https://www.mongodb.com.
-CONSOLE_CHANNEL_ID= // channel id logs
-AUTHORIZED_USERS= // user id
+TOKEN=                                   Your discord token
+MONGODB_URI=                             Create a mongo database. https://www.mongodb.com.
+CONSOLE_CHANNEL_ID=                      Channel id for logs
+AUTHORIZED_USERS=                        User ids (who can access ban and unban command)
 ```
 - tweak the channels ids in some files there
 - run `python main.py`
